@@ -63,7 +63,7 @@ each head has a modulator (sine, saw, triangle or random, 0.01–10 Hz):
 ## install
 
 ```
-;install https://github.com/<user>/smplr
+;install https://github.com/loopmasta/smplr
 ```
 
 or copy `smplr.lua` to `dust/code/smplr/`.
