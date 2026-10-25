@@ -1,4 +1,4 @@
--- smplr v0.2.0 by loopmasta
+-- smplr v0.3.0 by loopmasta
 -- |...       |...     ||..      ||   |...
 -- |||||:|:-----|||||||:---|||||||:----||||||:|||||||-
 -- |'''       |'''     ||''      ||   |'''
@@ -7,7 +7,10 @@
 -- ||||||:|-----||||||----|||||||:----||||||-||||||-
 -- |'        |'''     ||''      |'''  |'''
 
-local START = 1              -- recording start in the buffers (s); room for pre-roll
+-- only for the transient analysis (lib/Engine_Smplr.sc); the sound is softcut
+engine.name = "Smplr"
+
+local START = 1             -- recording start in the buffers (s); room for pre-roll
 local MAX_LENGTH_LIMIT = 300 -- upper end of the "max length" param (s);
                              -- a softcut buffer holds ~349 s
 local FADE = 0.05            -- crossfade / level fade time (s)
@@ -22,9 +25,11 @@ local HP_RQ = 1.4 -- 1/Q: Q 0.7, a plain 12 dB/oct slope (softcut's default rq 4
 
 -- head mode: direction or muted, in the order K1 + K3 cycles through them
 local REVERSE, FORWARD, MUTED = 1, 2, 3
--- what E2 does to the selected head's loop: move its start, or move the
--- whole loop (one setting for all heads)
-local E2_START, E2_MOVE = 1, 2
+-- what LOOP's E2 / E3 do to the selected head's loop: resize it (E2 its
+-- start, E3 its end) or move it, the length kept (both); one setting for
+-- all heads, toggled with a long K1 + K3
+local RESIZE, MOVE = 1, 2
+local LONG_PRESS = 0.5 -- K1 + K3 held this long in LOOP: resize <-> move (s)
 local WINDOW_STEP = 0.005 -- start / end change per encoder step (fraction of the recording)
 
 -- voices 1 (buffer 1, input L) and 2 (buffer 2, input R) make new recordings
@@ -100,9 +105,10 @@ local voice_head = {} -- voice -> head number, for the phase poll
 local sources = {}    -- accepted source per head, to skip what doesn't fit
 local selected = 1    -- head number
 local alt = false     -- K1 held
--- edit modes (K1 + E1). LOOP works directly (E2 start / move, E3 end);
--- the others are small lists over the waveform: E2 picks a setting of the
--- selected head, E3 changes it, and a popup shows its name and value
+-- edit modes (K1 + E1). LOOP works directly (E2 start / move, E3 end),
+-- free or from transient to transient (K1 + K3); the others are small
+-- lists over the waveform: E2 picks a setting of the selected head, E3
+-- changes it, and a popup shows its name and value
 local LOOP = 1
 local MODES = {
   {name = "LOOP"},
@@ -111,12 +117,16 @@ local MODES = {
   {name = "VIEW"}, -- direct too: E2 zoom, E3 scroll
 }
 local VIEW = 4
+-- LOOP's E2 / E3: free (fine steps) or jumping between the transients
+-- (one setting for all heads)
+local FREE, TRANSIENT = 1, 2
 local edit_mode = LOOP     -- smplr always starts in LOOP
 local picked = {}          -- per list mode: the setting E2 picked
 local POPUP_TIME = 2       -- s the mode name / setting popup stays after the last turn
 local note, note_until = nil, 0
 local punch           -- head number punching in (K2 held while playing), or nil
 local canvas_clock    -- turns the recording into an empty take if K2 is still held
+local loop_press_clock -- LOOP: K1 + K3 held; toggles resize / move once LONG_PRESS is up
 
 local waveform = {}   -- one column per pixel, each {buffer 1, buffer 2} peak 0..1
 local render_start, render_dur = 0, 0 -- the span (s, buffer time) the waveform covers
@@ -133,12 +143,27 @@ local redraw_metro
 local voices_on = false -- play / rec flags of the head voices
 local stop_clock        -- switches the voices off once playback has faded out
 
--- saved state: the recording after each take, the params (with the head
--- sources) on exit
+-- transients of the take (s from its start, ascending), found by the
+-- engine after every new take and punch-in; LOOP in transient jumps
+-- between them
+local onsets = {}
+local analysis = 0        -- number of the latest analysis; older answers are dropped
+local analysing = false
+local analyse_clock       -- a sensitivity change waits for the encoder to settle
+local ONSET_EDGE = 0.02   -- transients closer to the take's start are dropped (s)
+local SAMPLE_RATE = 48000 -- softcut's
+-- sensitivity 0..100 % sets the Onsets threshold, 1 .. 0.05 on an
+-- exponential scale; 40 % is 0.3: clear hits, not every grain
+local SENSITIVITY_DEFAULT = 40
+local THRESHOLD_MAX, THRESHOLD_MIN = 1, 0.05
+
+-- saved state: the recording and its length and transients after each
+-- take, the params (with the head sources) on exit
 local AUDIO_DIR = _path.audio .. "smplr/"
 local function audio_file() return AUDIO_DIR .. "loop.wav" end
 local function take_file() return norns.state.data .. "take.lua" end
 local function pset_file() return norns.state.data .. "last.pset" end
+local function onsets_file(n) return "/tmp/smplr-onsets-" .. n .. ".txt" end
 
 local stop_recording
 local stop_punch
@@ -371,6 +396,7 @@ local function rebuild_heads()
 end
 
 local play
+local reanalyse
 local loading = false -- a PSET is being read; the heads are rebuilt once it's done
 
 -- after a source change: fade out, hand out the voices again, carry on.
@@ -427,7 +453,12 @@ local function setup_params()
   params:add_number("loop_length", "loop length", 0, 0, 0,
     function() return length > 0 and string.format("%.2f s", length) or "-" end)
   params:set_save("loop_length", false)
-  params:add_option("e2", "E2", {"loop start", "move loop"}, E2_START)
+  params:add_option("loop_edit", "loop edit", {"resize", "move"}, RESIZE)
+  params:add_option("loop_points", "loop points", {"free", "transient"}, FREE)
+  -- how many transients are found: higher finds softer attacks too
+  params:add_control("sensitivity", "sensitivity",
+    controlspec.new(0, 100, "lin", 1, SENSITIVITY_DEFAULT, "%", 1 / 100))
+  params:set_action("sensitivity", function() reanalyse() end)
 
   local function seconds(p) return string.format("%.2f s", p:get() * length) end
   for h, d in ipairs(HEAD_DEFAULTS) do
@@ -566,12 +597,43 @@ end
 
 -- recording and playback ---------------------------------------------------
 
--- write the recording (plus the post-roll) and its length;
--- softcut writes the file in the background
+-- the take's length, and its transients once they're found for it (with
+-- the sensitivity they were found with)
+local function save_take_info(found)
+  tab.save({length = length, onsets = found and onsets or nil,
+    sensitivity = found and params:get("sensitivity") or nil}, take_file())
+end
+
+-- find the transients of loop.wav once it holds `seconds` s; the engine
+-- answers in osc.event. Until then the old transients stay usable.
+local function analyse(seconds)
+  analysis = analysis + 1
+  analysing = true
+  local threshold = THRESHOLD_MAX * (THRESHOLD_MIN / THRESHOLD_MAX) ^ (params:get("sensitivity") / 100)
+  engine.analyse(analysis, audio_file(), math.floor(seconds * SAMPLE_RATE), threshold,
+    onsets_file(analysis))
+end
+
+-- a new sensitivity: analyse the take again, once the encoder rests
+reanalyse = function()
+  if loading or (state ~= "stopped" and state ~= "playing") then return end
+  if analyse_clock then clock.cancel(analyse_clock) end
+  analyse_clock = clock.run(function()
+    clock.sleep(0.5)
+    analyse_clock = nil
+    analyse(0) -- loop.wav is complete
+  end)
+end
+
+-- write the recording (plus the post-roll) and its length, then find its
+-- transients. softcut writes the file in the background; the old one is
+-- removed first, so the analysis can't read it.
 local function save_take()
   util.make_dir(AUDIO_DIR)
+  os.remove(audio_file())
   softcut.buffer_write_stereo(audio_file(), START, length + FADE)
-  tab.save({length = length}, take_file())
+  save_take_info(false)
+  analyse(length + FADE)
 end
 
 -- a recording is in the buffers: every head at its loop start
@@ -583,6 +645,8 @@ local function loop_ready()
   end
 end
 
+-- the saved take, with its transients; they're found again if they're
+-- missing or were found with another sensitivity
 local function load_take()
   if state ~= "empty" then return end -- a recording was started meanwhile
   local take = tab.load(take_file())
@@ -591,6 +655,12 @@ local function load_take()
   length = take.length
   loop_ready()
   reset_view() -- rendered on the next frame, after the read (softcut does both in order)
+  if take.onsets and take.sensitivity == params:get("sensitivity") then
+    onsets = take.onsets
+  else
+    onsets = take.onsets or {}
+    analyse(0)
+  end
 end
 
 local function start_recording()
@@ -634,6 +704,7 @@ local function finish_take()
   selected = order[1] or 1
   loop_ready()
   reset_view() -- a new recording shows all of it
+  onsets = {}  -- until the new ones are found
   save_take()
 end
 
@@ -824,9 +895,16 @@ local function zoom_to_loop(h)
   show("zoom H" .. h)
 end
 
-local function toggle_e2()
-  params:set("e2", params:get("e2") == E2_START and E2_MOVE or E2_START)
-  show(params:get("e2") == E2_START and "E2 start" or "E2 move")
+local function transient() return params:get("loop_points") == TRANSIENT end
+
+local function toggle_points()
+  params:set("loop_points", transient() and FREE or TRANSIENT)
+  show(transient() and "transient" or "free")
+end
+
+local function toggle_loop_edit()
+  params:set("loop_edit", params:get("loop_edit") == MOVE and RESIZE or MOVE)
+  show(params:get("loop_edit") == MOVE and "move" or "resize")
 end
 
 local function toggle_mode(h)
@@ -857,8 +935,101 @@ local function toggle_zoom()
   end
 end
 
-local RANDOMIZE = {random_loop, random_sound, random_mod, zoom_to_loop}
-local TOGGLE = {function() toggle_e2() end, toggle_mode, toggle_mod, function() toggle_zoom() end}
+-- LOOP in transient: loop start and end jump between the transients; the
+-- take's start and end count as jump points too
+
+local POINT_EPS = 0.001  -- s; a point this close counts as the current one
+local RANDOM_SLICES = 8 -- longest random loop, in slices
+
+local function slice_points()
+  local p = {0}
+  for _, t in ipairs(onsets) do p[#p + 1] = t end
+  p[#p + 1] = length
+  return p
+end
+
+-- the next jump point after t (d > 0) or before it (d < 0), or nil
+local function next_point(p, t, d)
+  if d > 0 then
+    for i = 1, #p do
+      if p[i] > t + POINT_EPS then return p[i] end
+    end
+  else
+    for i = #p, 1, -1 do
+      if p[i] < t - POINT_EPS then return p[i] end
+    end
+  end
+end
+
+local function set_window(h, s, e)
+  params:set(param_id(h, "start"), s / length)
+  params:set(param_id(h, "stop"), e / length)
+end
+
+-- start and end stop at each other, as in LOOP
+local function slice_start(h, d)
+  local p = slice_points()
+  local s = params:get(param_id(h, "start")) * length
+  local e = params:get(param_id(h, "stop")) * length
+  for _ = 1, math.abs(d) do
+    local t = next_point(p, s, d)
+    if not t or t > e - MIN_LOOP then break end
+    s = t
+  end
+  params:set(param_id(h, "start"), s / length)
+end
+
+local function slice_end(h, d)
+  local p = slice_points()
+  local s = params:get(param_id(h, "start")) * length
+  local e = params:get(param_id(h, "stop")) * length
+  for _ = 1, math.abs(d) do
+    local t = next_point(p, e, d)
+    if not t or t < s + MIN_LOOP then break end
+    e = t
+  end
+  params:set(param_id(h, "stop"), e / length)
+end
+
+local function nearest_point(p, t)
+  local best = 1
+  for i = 2, #p do
+    if math.abs(p[i] - t) < math.abs(p[best] - t) then best = i end
+  end
+  return best
+end
+
+-- E2 in "move loop" mode: the loop jumps d transients and keeps the
+-- number of slices it spans (start and end first snap to the nearest ones)
+local function slice_move(h, d)
+  local p = slice_points()
+  local i = nearest_point(p, params:get(param_id(h, "start")) * length)
+  local j = nearest_point(p, params:get(param_id(h, "stop")) * length)
+  local k = math.max(1, j - i)
+  i = util.clamp(i + d, 1, #p - k)
+  -- move the leading edge first, so the window never shrinks in between
+  if d > 0 then
+    params:set(param_id(h, "stop"), p[i + k] / length)
+    params:set(param_id(h, "start"), p[i] / length)
+  else
+    params:set(param_id(h, "start"), p[i] / length)
+    params:set(param_id(h, "stop"), p[i + k] / length)
+  end
+end
+
+-- from a random transient over 1 .. RANDOM_SLICES slices
+local function random_slice(h)
+  local p = slice_points()
+  local i = math.random(1, #p - 1)
+  local k = math.random(1, math.min(RANDOM_SLICES, #p - i))
+  set_window(h, p[i], p[i + k])
+  show(string.format("slice %.1f-%.1f s", p[i], p[i + k]))
+end
+
+local RANDOMIZE = {
+  function(h) if transient() then random_slice(h) else random_loop(h) end end,
+  random_sound, random_mod, zoom_to_loop}
+local TOGGLE = {function() toggle_points() end, toggle_mode, toggle_mod, function() toggle_zoom() end}
 
 
 -- norns callbacks ----------------------------------------------------------
@@ -893,7 +1064,30 @@ local function wrap_params_read()
   end
 end
 
+-- the engine's answer to analyse(): the transients, one per line in
+-- `file` ("" if the analysis failed)
+local function onsets_found(n, file)
+  if n ~= analysis then return end -- an older analysis
+  analysing = false
+  if file == "" then
+    if transient() then show("analysis failed") end
+    return
+  end
+  local found = {}
+  for line in io.lines(file) do
+    local t = tonumber(line)
+    if t and t > ONSET_EDGE and t < length - MIN_LOOP then found[#found + 1] = t end
+  end
+  os.remove(file)
+  onsets = found
+  save_take_info(true)
+  if transient() then show(#onsets .. " transients") end
+end
+
 function init()
+  osc.event = function(path, args)
+    if path == "/smplr/onsets" then onsets_found(args[1], args[2]) end
+  end
   setup_params()
   setup_voices()
   wrap_params_read()
@@ -934,8 +1128,8 @@ local function keep_order(h, changed)
   end
 end
 
--- E2 in "move loop" mode: start and end move together, the length stays;
--- the loop stops at the recording's edges
+-- loop edit move: start and end move together, the length stays; the loop
+-- stops at the recording's edges
 local function move_loop(h, d)
   local s, e = params:get(param_id(h, "start")), params:get(param_id(h, "stop"))
   local shift = util.clamp(d * WINDOW_STEP / zoom(), -s, 1 - e)
@@ -983,8 +1177,22 @@ function key(n, z)
         make_canvas()
       end)
     end
-  elseif n == 3 and z == 1 and editable() then
-    if alt then
+  elseif n == 3 and z == 0 then
+    -- LOOP: K1 + K3 released before LONG_PRESS is the short press
+    if loop_press_clock then
+      clock.cancel(loop_press_clock)
+      loop_press_clock = nil
+      if editable() then TOGGLE[LOOP](selected) end
+    end
+  elseif n == 3 and editable() then
+    if alt and edit_mode == LOOP then
+      -- short: free <-> transient (on release); long: resize <-> move
+      loop_press_clock = clock.run(function()
+        clock.sleep(LONG_PRESS)
+        loop_press_clock = nil
+        if editable() then toggle_loop_edit() end
+      end)
+    elseif alt then
       TOGGLE[edit_mode](selected)
     elseif state == "playing" then
       stop()
@@ -1023,27 +1231,22 @@ function enc(n, d)
     end
     selected = order[util.clamp(i + d, 1, #order)]
   elseif edit_mode == LOOP then
-    -- steps get finer the further the view is zoomed in (the same distance
-    -- on screen), and the view follows the edited point
-    local step = d * WINDOW_STEP / zoom()
-    if n == 2 then
-      if params:get("e2") == E2_MOVE then
-        move_loop(selected, d)
-        -- follow the edge that leads the move
-        local edge = d > 0 and "stop" or "start"
-        keep_visible(params:get(param_id(selected, edge)) * length)
-      else
-        local id = param_id(selected, "start")
-        params:set(id, params:get(id) + step)
-        keep_order(selected, "start")
-        keep_visible(params:get(param_id(selected, "start")) * length)
-      end
+    -- free: steps get finer the further the view is zoomed in (the same
+    -- distance on screen); transient: from transient to transient. The
+    -- view follows the edited point (moving: the edge that leads).
+    local edge = n == 2 and "start" or "stop"
+    if transient() and #onsets == 0 then show(analysing and "analysing..." or "no transients") end
+    if params:get("loop_edit") == MOVE then
+      if transient() then slice_move(selected, d) else move_loop(selected, d) end
+      edge = d > 0 and "stop" or "start"
+    elseif transient() then
+      if n == 2 then slice_start(selected, d) else slice_end(selected, d) end
     else
-      local id = param_id(selected, "stop")
-      params:set(id, params:get(id) + step)
-      keep_order(selected, "stop")
-      keep_visible(params:get(param_id(selected, "stop")) * length)
+      local id = param_id(selected, edge)
+      params:set(id, params:get(id) + d * WINDOW_STEP / zoom())
+      keep_order(selected, edge)
     end
+    keep_visible(params:get(param_id(selected, edge)) * length)
   else
     -- list modes: E2 picks a setting, E3 changes it
     local items = MODES[edit_mode].items
@@ -1152,6 +1355,19 @@ local function draw_playhead(h, centers, half)
   screen.stroke()
 end
 
+-- loop points transient: a short bright tick on both lanes' center lines
+-- per transient, in every mode (so they show while zooming too)
+local function draw_onsets(centers)
+  screen.level(15)
+  for _, t in ipairs(onsets) do
+    local x = math.floor(time_x(t))
+    if x >= GRAPH_X and x < GRAPH_X + GRAPH_W then
+      for ch = 1, 2 do screen.rect(x, centers[ch] - 2, 1, 5) end
+    end
+  end
+  screen.fill()
+end
+
 local function draw_playheads(centers, half)
   for h in pairs(heads) do
     if h ~= selected then draw_playhead(h, centers, half) end
@@ -1186,7 +1402,10 @@ function redraw()
   else
     draw_waveform(centers, half)
   end
-  if state == "stopped" or state == "playing" then draw_loop_bars(bar_y) end
+  if state == "stopped" or state == "playing" then
+    if transient() then draw_onsets(centers) end
+    draw_loop_bars(bar_y)
+  end
   if state == "playing" then draw_playheads(centers, half) end
 
   -- popups, centered: the time so far while recording; the mode name or
@@ -1208,6 +1427,9 @@ function cleanup()
   params:write(pset_file())
   params.read = nil -- back to norns' own params:read
   if rec_clock then clock.cancel(rec_clock) end
+  if analyse_clock then clock.cancel(analyse_clock) end
+  if loop_press_clock then clock.cancel(loop_press_clock) end
+  osc.event = nil
   softcut.poll_stop_phase()
   for v = 1, softcut.VOICE_COUNT do
     softcut.rec(v, 0)
