@@ -44,7 +44,7 @@ in LOOP, holding K1 + K3 for half a second switches the loop edit between **resi
 
 after every new take and every punch-in, smplr finds the take's transients (SuperCollider's `Onsets`, in the background; a few seconds at most). K1 + K3 in LOOP switches the loop points between **free** (fine steps, as always) and **transient**: the transients show as ticks on the waveform (in every mode, so also while zooming in VIEW), and E2 / E3 jump the loop's start and end between them and the take's start and end. in move, E2 / E3 move the whole loop one transient at a time; K1 + K2 picks a random loop of 1–8 slices. `sensitivity` sets how many are found: higher finds softer attacks too. each transient sits a few milliseconds before its attack, so a loop starting there doesn't cut it off.
 
-[smplr demo with transient detection](https://youtu.be/A0jXmPob0JA)
+demo video with transient detection (screen and sound straight from the norns): [youtube.com/watch?v=A0jXmPob0JA](https://www.youtube.com/watch?v=A0jXmPob0JA)
 
 ### heads
 
